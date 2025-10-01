@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PH Earthquake Command Center - Live GUI</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
+<script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<script src="https://cdn.jsdelivr.net/gh/Leaflet/Leaflet.heat/dist/leaflet-heat.js"></script>
+<style>
+body, html { margin:0; padding:0; height:100%; font-family:'Orbitron',sans-serif; background:#0d0d0d; overflow:hidden; }
+#map { height:100%; width:100%; position:relative; }
+
+/* Panels */
+.panel { position:absolute; background:rgba(0,0,0,0.7); color:#00FF00; border:2px solid #00FF00; border-radius:6px; padding:5px; z-index:1000; font-size:12px; }
+#topBar { top:5px; left:5px; right:5px; display:flex; justify-content:space-between; gap:5px; }
+#clock { flex:1; text-align:center; }
+#quakeChartContainer { bottom:5px; left:5px; right:5px; height:25%; }
+#quakeList { bottom:30%; left:5px; right:5px; height:25%; overflow-y:scroll; }
+#toolsPanel { top:35%; right:5px; width:45%; }
+#seismoPanel { top:65%; left:5px; right:5px; height:15%; }
+#cityPanel { top:50%; left:5px; width:40%; background:rgba(0,0,0,0.8); padding:5px; border:2px solid #00FF00; border-radius:6px; }
+.city-magnitude { margin-bottom:5px; font-weight:bold; }
+.alert { color:#FF0000; font-weight:bold; }
+
+/* Animations */
+.radar-circle { border:2px solid #FF0000; border-radius:50%; position:absolute; pointer-events:none; animation:radarSweep 1.5s ease-out forwards; }
+@keyframes radarSweep { 0% { transform:scale(0.1); opacity:0.8; } 100% { transform:scale(1.5); opacity:0; } }
+@keyframes flashGlow { 0% { box-shadow: 0 0 5px #FF0000; } 50% { box-shadow: 0 0 20px #FF0000; } 100% { box-shadow: 0 0 5px #FF0000; } }
+.flash { animation: flashGlow 1s infinite; }
+@keyframes pulse { 0% { transform: scale(0.8); opacity: 0.6; } 50% { transform: scale(1.2); opacity: 0.3; } 100% { transform: scale(0.8); opacity: 0.6; } }
+.pulse-circle { animation: pulse 1s infinite; pointer-events: none; border-radius:50%; position:absolute; }
+
+/* Inputs */
+input[type=range], select, button { width:100%; margin-top:2px; background:#0d0d0d; color:#00FF00; border:1px solid #00FF00; border-radius:4px; }
+button:hover { background:#00FF00; color:#0d0d0d; cursor:pointer; }
+</style>
+</head>
+<body>
+<div id="map"></div>
+
+<!-- Panels -->
+<div id="topBar" class="panel">
+  <div id="clock">🕒 PH Time</div>
+</div>
+
+<div id="quakeChartContainer" class="panel">
+  <canvas id="quakeChart"></canvas>
+</div>
+
+<div id="quakeList" class="panel"></div>
+
+<div id="toolsPanel" class="panel">
+  <label>Magnitude Filter:</label>
+  <select id="magFilter">
+    <option value="0">All</option>
+    <option value="3">3+</option>
+    <option value="4.5">4.5+</option>
+    <option value="5.5">5.5+</option>
+  </select>
+  <button id="toggleHeatmap">Toggle Heatmap</button>
+  <button id="exportCSV">Export CSV</button>
+</div>
+
+<div id="seismoPanel" class="panel">
+  <canvas id="seismoChart"></canvas>
+</div>
+
+<div id="cityPanel" class="panel">
+  <div class="city-magnitude" id="manilaMag">Manila: 0</div>
+  <div class="city-magnitude" id="cebuMag">Cebu: 0</div>
+  <div class="city-magnitude" id="davaoMag">Davao: 0</div>
+</div>
+
+<script>
+window.onload = function(){
+const map=L.map('map').setView([12.8797,121.7740],6);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{attribution:'&copy; OpenStreetMap contributors', maxZoom:19}).addTo(map);
+let heatLayer=L.heatLayer([], {radius:25, blur:15, maxZoom:10}).addTo(map);
+
+// Charts
+const quakeCtx=document.getElementById('quakeChart').getContext('2d');
+const quakeChart=new Chart(quakeCtx,{
+  type:'line',
+  data:{labels:[], datasets:[
+    {label:'Magnitude', data:[], borderColor:'#FF0000', backgroundColor:'rgba(255,0,0,0.2)', fill:true},
+    {label:'Depth', data:[], borderColor:'#00FFFF', backgroundColor:'rgba(0,255,255,0.2)', fill:true}
+  ]},
+  options:{responsive:true, scales:{x:{ticks:{color:'#00FF00'}}, y:{ticks:{color:'#00FF00'}, beginAtZero:true}}, plugins:{legend:{labels:{color:'#00FF00'}}}}
+});
+
+const seismoCtx=document.getElementById('seismoChart').getContext('2d');
+const seismoChart=new Chart(seismoCtx,{
+  type:'line',
+  data:{labels:Array(50).fill(''), datasets:[{label:'Seismograph', data:Array(50).fill(0), borderColor:'#FFFF00', fill:false, tension:0.3}]},
+  options:{responsive:true, animation:false, scales:{x:{display:false}, y:{ticks:{color:'#00FF00'}, beginAtZero:true}}, plugins:{legend:{labels:{color:'#00FF00'}}}}
+});
+
+// Clock
+function updateClock(){ document.getElementById('clock').innerText='🕒 PH Time: '+new Date().toLocaleTimeString(); }
+setInterval(updateClock,1000); updateClock();
+
+// Cities
+const cities=[
+  {name:'Manila', lat:14.5995, lon:120.9842, id:'manilaMag'},
+  {name:'Cebu', lat:10.3157, lon:123.8854, id:'cebuMag'},
+  {name:'Davao', lat:7.1907, lon:125.4553, id:'davaoMag'}
+];
+
+let quakeData=[];
+const bounds={minlatitude:5, maxlatitude:20, minlongitude:115, maxlongitude:130};
+function getIntensityColor(mag){ if(mag<3) return '#00FF00'; if(mag<4.5) return '#FFFF00'; if(mag<5.5) return '#FFA500'; return '#FF0000'; }
+function isToday(timestamp){ const d=new Date(timestamp), today=new Date(); return d.getFullYear()===today.getFullYear() && d.getMonth()===today.getMonth() && d.getDate()===today.getDate(); }
+function createRadarSweep(lat,lon){ const point=map.latLngToContainerPoint([lat,lon]); const circle=document.createElement('div'); circle.className='radar-circle'; circle.style.left=(point.x-15)+'px'; circle.style.top=(point.y-15)+'px'; circle.style.width='30px'; circle.style.height='30px'; document.getElementById('map').appendChild(circle); setTimeout(()=>circle.remove(),1500); }
+
+// Update city magnitudes live
+function updateCityMagnitude(quakes){
+  cities.forEach(city=>{
+    let maxMag=0;
+    quakes.forEach(q=>{
+      const [lon,lat]=q.geometry.coordinates;
+      const d=Math.sqrt(Math.pow(city.lat-lat,2)+Math.pow(city.lon-lon,2));
+      if(d<2) maxMag=Math.max(maxMag,q.properties.mag);
+    });
+    const cityEl=document.getElementById(city.id);
+    cityEl.innerText=`${city.name}: ${maxMag}`;
+    if(maxMag>=5.5){ cityEl.style.color='#FF0000'; cityEl.classList.add('flash'); }
+    else if(maxMag>=4.5){ cityEl.style.color='#FFA500'; cityEl.classList.remove('flash'); }
+    else if(maxMag>=3){ cityEl.style.color='#FFFF00'; cityEl.classList.remove('flash'); }
+    else{ cityEl.style.color='#00FF00'; cityEl.classList.remove('flash'); }
+    if(city.circle) map.removeLayer(city.circle);
+    if(maxMag>0){
+      city.circle=L.circle([city.lat,city.lon],{color:getIntensityColor(maxMag), fillColor:getIntensityColor(maxMag), fillOpacity:0.3, radius:40000}).addTo(map);
+    }
+  });
+}
+
+// Live fetch and update function
+async function fetchQuakes(){
+  try{
+    const url=`https://earthquake.usgs.gov/fdsnws/event/1/query?format=geojson&minlatitude=${bounds.minlatitude}&maxlatitude=${bounds.maxlatitude}&minlongitude=${bounds.minlongitude}&maxlongitude=${bounds.maxlongitude}&orderby=time&limit=50`;
+    const res=await fetch(url); const data=await res.json();
+    quakeData=data.features.filter(q=>isToday(q.properties.time));
+    quakeData.sort((a,b)=>a.properties.time-b.properties.time);
+    renderLiveQuakes();
+  }catch(err){console.error(err);}
+}
+
+// Render live quakes
+function renderLiveQuakes(){
+  const magFilter=parseFloat(document.getElementById('magFilter').value)||0;
+  const quakes=quakeData.filter(q=>q.properties.mag>=magFilter);
+  const quakeList=document.getElementById('quakeList');
+  quakeList.innerHTML='';
+  quakeChart.data.labels=[]; quakeChart.data.datasets[0].data=[]; quakeChart.data.datasets[1].data=[];
+  heatLayer.setLatLngs([]);
+  map.eachLayer(layer=>{ if(layer instanceof L.Circle && !cities.includes(layer)) map.removeLayer(layer); });
+
+  quakes.forEach(q=>{
+    const {mag,place,time}=q.properties;
+    const [lon,lat,depth]=q.geometry.coordinates;
+    const color=getIntensityColor(mag);
+
+    // Map circle
+    L.circle([lat,lon],{color,fillColor:color,fillOpacity:0.6,radius:mag*10000}).addTo(map)
+      .bindPopup(`Magnitude:${mag}<br>Depth:${depth} km<br>Location:${place}<br>Time:${new Date(time).toLocaleTimeString()}`);
+
+    // Radar
+    createRadarSweep(lat,lon);
+
+    // Pulse for strong quakes
+    if(mag>=5.5){
+      const pulseDiv=document.createElement('div');
+      pulseDiv.className='pulse-circle';
+      const point=map.latLngToContainerPoint([lat,lon]);
+      pulseDiv.style.width='50px'; pulseDiv.style.height='50px';
+      pulseDiv.style.left=(point.x-25)+'px'; pulseDiv.style.top=(point.y-25)+'px';
+      pulseDiv.style.border=`2px solid ${color}`;
+      document.getElementById('map').appendChild(pulseDiv);
+      setTimeout(()=>pulseDiv.remove(),10000);
+    }
+
+    // Update charts
+    quakeChart.data.labels.push(new Date(time).toLocaleTimeString());
+    quakeChart.data.datasets[0].data.push(mag);
+    quakeChart.data.datasets[1].data.push(depth);
+    heatLayer.addLatLng([lat,lon,mag*2]);
+
+    // List
+    const div=document.createElement('div');
+    div.className='quake-item';
+    if(mag>=5.5) div.classList.add('alert');
+    div.innerHTML=`Time:${new Date(time).toLocaleTimeString()} | Mag:${mag} | Depth:${depth} km | ${place}`;
+    quakeList.appendChild(div);
+
+    // Update seismograph
+    seismoChart.data.datasets[0].data.shift();
+    seismoChart.data.datasets[0].data.push(mag);
+  });
+
+  updateCityMagnitude(quakes);
+  quakeChart.update();
+  seismoChart.update();
+}
+
+// Event listeners
+document.getElementById('magFilter').addEventListener('change', renderLiveQuakes);
+
+// Heatmap toggle
+let heatOn=true;
+document.getElementById('toggleHeatmap').addEventListener('click', ()=>{
+  heatOn=!heatOn;
+  if(heatOn) heatLayer.addTo(map); else map.removeLayer(heatLayer);
+});
+
+// Export CSV
+document.getElementById('exportCSV').addEventListener('click', ()=>{
+  let csv='Time,Magnitude,Depth,Place,Latitude,Longitude\n';
+  quakeData.forEach(q=>{
+    const {mag,place,time}=q.properties;
+    const [lon,lat,depth]=q.geometry.coordinates;
+    csv+=`${new Date(time).toLocaleTimeString()},${mag},${depth},${place},${lat},${lon}\n`;
+  });
+  const blob=new Blob([csv],{type:'text/csv'});
+  const link=document.createElement('a');
+  link.href=URL.createObjectURL(blob);
+  link.download='quake_data.csv';
+  link.click();
+});
+
+// Initial fetch & live refresh every 10s
+fetchQuakes();
+setInterval(fetchQuakes,10000);
+
+// Draggable panels
+function makeDraggable(el){
+  let posX=0,posY=0,startX=0,startY=0;
+  el.addEventListener('touchstart', dragStart,{passive:false});
+  el.addEventListener('mousedown', dragStart);
+  function dragStart(e){
+    e.preventDefault();
+    if(e.type==='touchstart'){
+      startX=e.touches[0].clientX; startY=e.touches[0].clientY;
+      document.addEventListener('touchmove', dragMove,{passive:false});
+      document.addEventListener('touchend', dragEnd);
+    } else {
+      startX=e.clientX; startY=e.clientY;
+      document.addEventListener('mousemove', dragMove);
+      document.addEventListener('mouseup', dragEnd);
+    }
+    posX=el.offsetLeft; posY=el.offsetTop;
+  }
+  function dragMove(e){
+    e.preventDefault();
+    let clientX=(e.type.includes('touch'))?e.touches[0].clientX:e.clientX;
+    let clientY=(e.type.includes('touch'))?e.touches[0].clientY:e.clientY;
+    el.style.left=posX+(clientX-startX)+'px';
+    el.style.top=posY+(clientY-startY)+'px';
+  }
+  function dragEnd(){
+    document.removeEventListener('mousemove', dragMove);
+    document.removeEventListener('mouseup', dragEnd);
+    document.removeEventListener('touchmove', dragMove);
+    document.removeEventListener('touchend', dragEnd);
+  }
+}
+['topBar','quakeChartContainer','quakeList','toolsPanel','seismoPanel','cityPanel'].forEach(id=>{
+  makeDraggable(document.getElementById(id));
+});
+};
